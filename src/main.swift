@@ -1,4 +1,4 @@
-// Toast Status v3 — menu bar monitor for the Coop's Hayward Toast sync runner.
+// Toast Status v3.1 — menu bar monitor for the Coop's Hayward Toast sync runner.
 // One app, two modes (set by the installer): "mini" (local, on the Mac mini) or "remote" (e.g. Mac Studio).
 // The status token lives only in the login Keychain (service com.croo.toast-status).
 import Cocoa
@@ -7,7 +7,7 @@ import Security
 import CryptoKit
 import UserNotifications
 
-let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.0.0"
+let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.1.0"
 let RELEASES_API = "https://api.github.com/repos/jandriancroo/toast-status/releases/latest"
 let API = "https://lmodeiyrpwvgyqcvjkjr.supabase.co/functions/v1/toast-status"
 let CROOHQ_URL = "https://croohq.com"
@@ -22,6 +22,7 @@ let logPath = runnerDir + "/logs/runner.out.log"
 let runNowPath = runnerDir + "/Run Now.command"
 let runnerLabel = "com.croo.toast-runner"
 let PT = TimeZone(identifier: "America/Los_Angeles")!
+let CT = TimeZone(identifier: "America/Chicago")!  // runner poll window is defined in Wisconsin time
 
 // MARK: helpers
 @discardableResult
@@ -76,12 +77,37 @@ func ago(_ secs: Int) -> String {
     if s >= 3600 { return "\(s / 3600)h \(String(format: "%02d", (s % 3600) / 60))m" }
     return "\(s / 60)m \(String(format: "%02d", s % 60))s"
 }
-// Store window 7 AM – 9 PM PT
-func inStoreWindow(_ d: Date = Date()) -> Bool {
-    var cal = Calendar(identifier: .gregorian); cal.timeZone = PT
+// Runner poll window: 6:00 AM – 11:00 PM America/Chicago (= 4 AM – 9 PM PT). Outside it the runner is idle by design.
+let POLL_START_MIN = 6 * 60, POLL_END_MIN = 23 * 60, GRACE_MIN = 15
+func ctMinutes(_ d: Date) -> Int {
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
     let c = cal.dateComponents([.hour, .minute], from: d)
-    let m = (c.hour ?? 0) * 60 + (c.minute ?? 0)
-    return m >= 7 * 60 && m < 21 * 60
+    return (c.hour ?? 0) * 60 + (c.minute ?? 0)
+}
+func inStoreWindow(_ d: Date = Date()) -> Bool { let m = ctMinutes(d); return m >= POLL_START_MIN && m < POLL_END_MIN }
+// Today's window start (6:00 AM Chicago) as an absolute Date.
+func windowStart(_ d: Date = Date()) -> Date {
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
+    return cal.date(bySettingHour: POLL_START_MIN / 60, minute: 0, second: 0, of: d) ?? d
+}
+// Today's window end (11:00 PM Chicago) as an absolute Date.
+func windowEnd(_ d: Date = Date()) -> Date {
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
+    return cal.date(bySettingHour: POLL_END_MIN / 60, minute: 0, second: 0, of: d) ?? d
+}
+// First 15 min of the window (6:00–6:15 AM Chicago): no red yet while the runner starts.
+func inStartGrace(_ d: Date = Date()) -> Bool { let m = ctMinutes(d); return m >= POLL_START_MIN && m < POLL_START_MIN + GRACE_MIN }
+func shortTZ(_ tz: TimeZone, _ d: Date) -> String {
+    let abbr = tz.abbreviation(for: d) ?? ""
+    return abbr.hasPrefix("P") && abbr.hasSuffix("T") ? "PT" : (abbr.hasPrefix("C") && abbr.hasSuffix("T") ? "CT" : abbr)
+}
+// Next 6:00 AM Chicago, shown in this Mac's local time zone, e.g. "Resumes 4:00 AM PT".
+func resumesText(_ d: Date = Date()) -> String {
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
+    var next = windowStart(d)
+    if next <= d { next = cal.date(byAdding: .day, value: 1, to: next) ?? next }
+    let f = DateFormatter(); f.timeZone = TimeZone.current; f.dateFormat = "h:mm a"
+    return "Resumes \(f.string(from: next)) \(shortTZ(TimeZone.current, next))"
 }
 func versionIsNewer(_ a: String, than b: String) -> Bool {
     let pa = a.split(separator: ".").map { Int($0) ?? 0 }, pb = b.split(separator: ".").map { Int($0) ?? 0 }
@@ -99,6 +125,22 @@ func firstMatch(_ pattern: String, _ text: String) -> [String]? {
 }
 
 // MARK: model
+enum UpdState: Equatable {
+    case idle, checking, upToDate, available(String), updating, failed(String)
+    var label: String {
+        switch self {
+        case .idle: return "Check for updates"
+        case .checking: return "Checking…"
+        case .upToDate: return "Up to date"
+        case .available(let v): return "Update to \(v)"
+        case .updating: return "Updating…"
+        case .failed(let e): return e
+        }
+    }
+    var busy: Bool { self == .checking || self == .updating }
+    var isAvailable: Bool { if case .available = self { return true }; return false }
+    var isError: Bool { if case .failed = self { return true }; return false }
+}
 let HIST_KEY = "syncHistory"
 final class Model: ObservableObject {
     @Published var mode = appMode()
@@ -114,6 +156,8 @@ final class Model: ObservableObject {
     @Published var weekdayName = ""
     @Published var laborPct: Double?
     @Published var miniOnline: Bool?
+    @Published var heartbeatAt: Date?
+    @Published var updState: UpdState = .idle
     @Published var runnerRunning: Bool?
     @Published var sessionHours: Double?
     @Published var restartPending = false
@@ -132,14 +176,30 @@ final class Model: ObservableObject {
     }
 
     var staleSecs: Int? { lastSync.map { Int(now.timeIntervalSince($0)) } }
-    var level: Int { // menu bar dot: 0 green, 1 yellow, 2 red, 3 gray (outside store hours)
-        guard let s = staleSecs else { return inStoreWindow(now) ? 2 : 3 }
-        if !inStoreWindow(now) { return 3 }
+    var offHours: Bool { !inStoreWindow(now) }
+    // Start-of-window grace: no sync yet today and still before 6:15 AM Chicago.
+    var starting: Bool { inStartGrace(now) && (lastSync.map { $0 < windowStart(now) } ?? true) }
+    // Mini heartbeat missing > 15 min during the poll window (after grace). Overnight this is just idle.
+    var miniAsleep: Bool {
+        if offHours || starting || mode == "mini" { return false }
+        guard let hb = heartbeatAt else { return true }
+        return now.timeIntervalSince(hb) > 900
+    }
+    var level: Int { // menu bar dot: 0 green, 1 yellow, 2 red, 3 gray (off hours / starting), 4 mini asleep (non-alarming)
+        if offHours || starting { return 3 }
+        if miniAsleep { return 4 }
+        guard let s = staleSecs else { return 2 }
         return s >= 900 ? 2 : (s >= 600 ? 1 : 0)
     }
-    var color: Color { [Color.green, Color.yellow, Color.red, Color.gray][level] }
-    var nsColor: NSColor { [NSColor.systemGreen, .systemYellow, .systemRed, .systemGray][level] }
-    var staleColor: Color { guard let s = staleSecs else { return .red }; return s >= 900 ? .red : (s >= 600 ? .yellow : .primary) }
+    static let grayBlue = Color(red: 0.55, green: 0.62, blue: 0.72)
+    static let asleepColor = Color(red: 0.62, green: 0.56, blue: 0.86)  // soft lavender: distinct, not an alarm
+    // Popover header dot: gray-blue off hours; menu bar uses plain gray via nsColor.
+    var color: Color { [Color.green, Color.yellow, Color.red, Model.grayBlue, Model.asleepColor][level] }
+    var nsColor: NSColor { [NSColor.systemGreen, .systemYellow, .systemRed, .systemGray, .systemPurple][level] }
+    var staleColor: Color {
+        if level >= 3 { return .secondary }
+        guard let s = staleSecs else { return .red }; return s >= 900 ? .red : (s >= 600 ? .yellow : .primary)
+    }
 
     var runnerDown: Bool {
         if runnerRunning == false { return true }
@@ -148,10 +208,22 @@ final class Model: ObservableObject {
     // Mac mini card: word + glow
     var statusWord: String {
         if restartPending || selfUpdating { return "Updating" }
+        if offHours { return "Off hours" }
+        if starting { return "Starting up" }
+        if miniAsleep { return "Mini asleep?" }
         if runnerDown || (staleSecs ?? Int.max) >= 900 { return "Offline" }
         return "Online"
     }
+    var statusSub: String? {
+        if restartPending || selfUpdating { return nil }
+        if offHours { return resumesText(now) }
+        if starting { return "Waiting for first sync" }
+        if miniAsleep { return heartbeatAt.map { "No heartbeat for \(ago(Int(now.timeIntervalSince($0))))" } ?? "No heartbeat yet" }
+        return nil
+    }
     var glow: Color {
+        if statusWord == "Off hours" || statusWord == "Starting up" { return .gray }
+        if statusWord == "Mini asleep?" { return Model.asleepColor }
         if statusWord == "Offline" { return .red }
         if statusWord == "Updating" || (staleSecs ?? 0) >= 600 { return .yellow }
         return .green
@@ -170,7 +242,16 @@ struct SyncLog: View {
     @ObservedObject var m: Model
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            if let l = m.lastSync {
+            if m.offHours {
+                let lastCheck = m.lastSync.map { min($0, windowEnd($0)) }  // e.g. last pull ~9:00 PM PT
+                Text("Last check \(lastCheck.map { ptTime($0) } ?? "—") · alerts paused overnight")
+                    .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
+                Text("Runner polls 6 AM–11 PM CT · \(resumesText(m.now))").font(.system(size: 11)).foregroundColor(.secondary)
+            } else if m.starting {
+                Text("Starting up · last check \(m.lastSync.map { ptTime($0) } ?? "—")")
+                    .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
+                Text("Grace until 6:15 AM CT").font(.system(size: 11)).foregroundColor(.secondary)
+            } else if let l = m.lastSync {
                 let due = l.addingTimeInterval(300)
                 let left = Int(due.timeIntervalSince(m.now))
                 Text("Last check \(ptTime(l)) · next due \(ptTime(due))")
@@ -206,7 +287,10 @@ struct MiniCard: View {
                 Image(systemName: symbol).font(.system(size: 84, weight: .regular))
                     .foregroundColor(.primary).shadow(color: m.glow.opacity(0.9), radius: 12)
             }.frame(width: 190, height: 170)
-            Text(m.statusWord).font(.system(size: 26, weight: .bold)).foregroundColor(m.glow)
+            VStack(spacing: 2) {
+                Text(m.statusWord).font(.system(size: 26, weight: .bold)).foregroundColor(m.glow)
+                if let sub = m.statusSub { Text(sub).font(.system(size: 12)).foregroundColor(.secondary) }
+            }
         }.frame(maxWidth: .infinity)
     }
 }
@@ -217,6 +301,7 @@ struct PopView: View {
     var openHQ: () -> Void
     var runUpdate: () -> Void
     var quit: () -> Void
+    var updateButton: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -269,6 +354,9 @@ struct PopView: View {
             }.padding(.top, 14)
             HStack {
                 Text("Toast Status \(APP_VERSION) · \(m.mode == "mini" ? "mini (local)" : "remote")").font(.system(size: 11)).foregroundColor(.secondary)
+                Button(m.updState.label, action: updateButton).buttonStyle(PlainButtonStyle()).font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(m.updState.isError ? .orange : (m.updState.isAvailable ? .blue : .secondary))
+                    .disabled(m.updState.busy)
                 Spacer()
                 Button("Quit", action: quit).buttonStyle(PlainButtonStyle()).font(.system(size: 11)).foregroundColor(.secondary)
             }.padding(.top, 10)
@@ -293,7 +381,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let v = PopView(m: m, restart: { [weak self] in self?.restartTapped() },
                         openHQ: { NSWorkspace.shared.open(URL(string: CROOHQ_URL)!) },
                         runUpdate: { [weak self] in self?.applyUpdate() },
-                        quit: { NSApp.terminate(nil) })
+                        quit: { NSApp.terminate(nil) },
+                        updateButton: { [weak self] in self?.updateButtonTapped() })
         popover.contentViewController = NSHostingController(rootView: v)
         popover.behavior = .transient
         popover.delegate = self
@@ -324,7 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         t.append(NSAttributedString(string: "Toast"))
         item.button?.attributedTitle = t
         // stale notification: > 15 min during store window, once per stale episode
-        if m.level == 2, inStoreWindow(m.now), let s = m.staleSecs, s > 900 {
+        if m.level == 2, inStoreWindow(m.now), !m.starting, let s = m.staleSecs, s > 900 {
             if !notifiedStale { notifiedStale = true; notify("Toast sync is stale", "Last sync \(ago(s)) ago at \(m.locationName).") }
         } else if m.level == 0 { notifiedStale = false }
     }
@@ -387,12 +476,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         m.lastSync = pull ?? hb
         m.updatedAt = parseDate(j["server_time"] as? String) ?? Date()
         m.miniOnline = hb.map { Date().timeIntervalSince($0) < 600 }
+        m.heartbeatAt = hb
         m.sessionHours = num(r["session_age_hours"])
         if let p = pull { m.record(p) }
         let state = (r["state"] as? String) ?? ""
         m.runnerState = state
         m.runnerRunning = nil
-        m.stateText = m.level == 2 ? "No sync" : (state.isEmpty ? "Syncing" : (state == "polling" ? "Syncing" : state.capitalized))
+        m.stateText = m.offHours ? "Off hours" : (m.level == 2 ? "No sync" : (state.isEmpty ? "Syncing" : (state == "polling" ? "Syncing" : state.capitalized)))
         let s = j["sales"] as? [String: Any] ?? [:]
         m.sales = num(s["net_sales"])
         m.checks = num(s["check_count"]).map { Int($0) }
@@ -483,9 +573,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     // MARK: self-update
-    func checkForUpdate() {
-        if updating || Date().timeIntervalSince(lastUpdateCheck) < 60 { return }
+    // Footer button: manual check (bypasses the 60s throttle) or install a found release now.
+    func updateButtonTapped() {
+        switch m.updState {
+        case .available: applyUpdate()
+        case .checking, .updating: return
+        default: checkForUpdate(manual: true)
+        }
+    }
+
+    func manualResult(_ s: UpdState) {
+        DispatchQueue.main.async {
+            self.m.updState = s
+            if s == .upToDate || s.isError {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { if self.m.updState == s { self.m.updState = .idle } }
+            }
+        }
+    }
+
+    func checkForUpdate(manual: Bool = false) {
+        if updating { return }
+        if !manual && Date().timeIntervalSince(lastUpdateCheck) < 60 { return }
         lastUpdateCheck = Date()
+        if manual { m.updState = .checking }
+        let report: (UpdState) -> Void = { [weak self] s in if manual { self?.manualResult(s) } }
         var r = URLRequest(url: URL(string: RELEASES_API)!, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         r.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         r.setValue("ToastStatus/\(APP_VERSION)", forHTTPHeaderField: "User-Agent")
@@ -493,24 +604,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard (resp as? HTTPURLResponse)?.statusCode == 200, let d = data,
                   let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
                   let tag = j["tag_name"] as? String, tag.hasPrefix("v"),
-                  let assets = j["assets"] as? [[String: Any]] else { return }
+                  let assets = j["assets"] as? [[String: Any]] else { report(.failed("Update check failed")); return }
             let v = String(tag.dropFirst())
             func url(_ name: String) -> URL? {
                 guard let a = assets.first(where: { ($0["name"] as? String) == name }),
                       let s = a["browser_download_url"] as? String, let u = URL(string: s), u.scheme == "https" else { return nil }
                 return u
             }
-            guard versionIsNewer(v, than: APP_VERSION) else { DispatchQueue.main.async { self?.m.updateText = nil }; return }
-            guard let zipURL = url("toast-status-src.zip"), let shaURL = url("toast-status-src.zip.sha256") else { return }
+            guard versionIsNewer(v, than: APP_VERSION) else { DispatchQueue.main.async { self?.m.updateText = nil }; report(.upToDate); return }
+            guard let zipURL = url("toast-status-src.zip"), let shaURL = url("toast-status-src.zip.sha256") else { report(.failed("Release \(v) missing assets")); return }
             URLSession.shared.dataTask(with: shaURL) { sdata, sresp, _ in
                 guard (sresp as? HTTPURLResponse)?.statusCode == 200, let sd = sdata,
                       let txt = String(data: sd, encoding: .utf8),
-                      let sha = firstMatch("^([0-9a-fA-F]{64})", txt.trimmingCharacters(in: .whitespacesAndNewlines))?[1] else { return }
+                      let sha = firstMatch("^([0-9a-fA-F]{64})", txt.trimmingCharacters(in: .whitespacesAndNewlines))?[1] else { report(.failed("Bad release checksum")); return }
                 DispatchQueue.main.async {
                     guard let self = self else { return }
                     self.pendingRelease = (v, zipURL, sha.lowercased())
                     self.m.updateText = "Update available (\(v))"
-                    self.applyUpdate()
+                    if manual { self.m.updState = .available(v) } else { self.applyUpdate() }  // auto path unchanged
                 }
             }.resume()
         }.resume()
@@ -521,9 +632,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         updating = true
         m.selfUpdating = true
         m.updateText = "Updating to \(rel.version)…"
+        m.updState = .updating
         URLSession.shared.downloadTask(with: rel.url) { [weak self] tmp, resp, _ in
             guard let self = self else { return }
-            func fail(_ msg: String) { DispatchQueue.main.async { self.updating = false; self.m.selfUpdating = false; self.m.updateText = "Update available (\(rel.version))"; self.m.flash = msg } }
+            func fail(_ msg: String) { DispatchQueue.main.async { self.updating = false; self.m.selfUpdating = false; self.m.updateText = "Update available (\(rel.version))"; self.m.flash = msg; self.m.updState = .failed(msg) } }
             guard let tmp = tmp, (resp as? HTTPURLResponse)?.statusCode == 200, let data = try? Data(contentsOf: tmp) else { return fail("Update download failed.") }
             let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             guard digest == rel.sha else { return fail("Update rejected: sha256 mismatch.") }
