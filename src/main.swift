@@ -1,4 +1,4 @@
-// Toast Status v3.1 — menu bar monitor for the Coop's Hayward Toast sync runner.
+// Toast Status v3.2 — menu bar monitor for the Coop's Hayward Toast sync runner.
 // One app, two modes (set by the installer): "mini" (local, on the Mac mini) or "remote" (e.g. Mac Studio).
 // The status token lives only in the login Keychain (service com.croo.toast-status).
 import Cocoa
@@ -141,7 +141,20 @@ enum UpdState: Equatable {
     var isAvailable: Bool { if case .available = self { return true }; return false }
     var isError: Bool { if case .failed = self { return true }; return false }
 }
-let HIST_KEY = "syncHistory"
+let HIST_KEY_OLD = "syncHistory"      // v3.0–3.1: [Double] epoch seconds only
+let HIST_KEY = "syncHistoryV2"        // v3.2+: [[String: Double]] with t / sales / checks
+struct SyncEntry { let at: Date; let sales: Double?; let checks: Int? }
+func loadHistory() -> [SyncEntry] {
+    let ud = UserDefaults.standard
+    if let arr = ud.array(forKey: HIST_KEY) as? [[String: Double]] {
+        return arr.compactMap { d in
+            guard let t = d["t"] else { return nil }
+            return SyncEntry(at: Date(timeIntervalSince1970: t), sales: d["sales"], checks: d["checks"].map { Int($0) })
+        }
+    }
+    let old = ud.array(forKey: HIST_KEY_OLD) as? [Double] ?? []
+    return old.map { SyncEntry(at: Date(timeIntervalSince1970: $0), sales: nil, checks: nil) }
+}
 final class Model: ObservableObject {
     @Published var mode = appMode()
     @Published var now = Date()
@@ -165,14 +178,21 @@ final class Model: ObservableObject {
     @Published var flash: String?
     @Published var error: String?
     @Published var updateText: String?
-    @Published var history: [Date] = (UserDefaults.standard.array(forKey: HIST_KEY) as? [Double] ?? []).map { Date(timeIntervalSince1970: $0) }
+    @Published var signedOut = false
+    @Published var history: [SyncEntry] = loadHistory()
 
-    func record(_ d: Date) {
-        if let last = history.last, abs(last.timeIntervalSince(d)) < 1 { return }
-        if let last = history.last, d < last { return }
-        history.append(d)
+    func record(_ d: Date, sales: Double?, checks: Int?) {
+        if let last = history.last, abs(last.at.timeIntervalSince(d)) < 1 { return }
+        if let last = history.last, d < last.at { return }
+        history.append(SyncEntry(at: d, sales: sales, checks: checks))
         if history.count > 6 { history.removeFirst(history.count - 6) }
-        UserDefaults.standard.set(history.map { $0.timeIntervalSince1970 }, forKey: HIST_KEY)
+        let enc: [[String: Double]] = history.map { e in
+            var o: [String: Double] = ["t": e.at.timeIntervalSince1970]
+            if let v = e.sales { o["sales"] = v }
+            if let c = e.checks { o["checks"] = Double(c) }
+            return o
+        }
+        UserDefaults.standard.set(enc, forKey: HIST_KEY)
     }
 
     var staleSecs: Int? { lastSync.map { Int(now.timeIntervalSince($0)) } }
@@ -211,6 +231,7 @@ final class Model: ObservableObject {
         if offHours { return "Off hours" }
         if starting { return "Starting up" }
         if miniAsleep { return "Mini asleep?" }
+        if signedOut { return "Signed out" }
         if runnerDown || (staleSecs ?? Int.max) >= 900 { return "Offline" }
         return "Online"
     }
@@ -219,12 +240,13 @@ final class Model: ObservableObject {
         if offHours { return resumesText(now) }
         if starting { return "Waiting for first sync" }
         if miniAsleep { return heartbeatAt.map { "No heartbeat for \(ago(Int(now.timeIntervalSince($0))))" } ?? "No heartbeat yet" }
+        if signedOut { return "Run Sign In Once.command" }
         return nil
     }
     var glow: Color {
         if statusWord == "Off hours" || statusWord == "Starting up" { return .gray }
         if statusWord == "Mini asleep?" { return Model.asleepColor }
-        if statusWord == "Offline" { return .red }
+        if statusWord == "Offline" || statusWord == "Signed out" { return .red }
         if statusWord == "Updating" || (staleSecs ?? 0) >= 600 { return .yellow }
         return .green
     }
@@ -237,7 +259,11 @@ func gapText(_ secs: Int) -> String {
 }
 
 // MARK: view
-struct SyncRow { let at: Date; let gap: Int? }
+struct SyncRow { let at: Date; let sales: Double?; let delta: Double?; let gap: Int? }
+func deltaText(_ d: Double) -> String {
+    if abs(d) < 0.005 { return "±$0.00" }
+    return (d > 0 ? "+" : "-") + money(abs(d))
+}
 struct SyncLog: View {
     @ObservedObject var m: Model
     var body: some View {
@@ -262,10 +288,19 @@ struct SyncLog: View {
                 Text("Last check — never").font(.system(size: 13, weight: .semibold)).foregroundColor(.red)
             }
             let h = m.history
-            let rows: [SyncRow] = h.indices.reversed().prefix(5).map { i in SyncRow(at: h[i], gap: i > 0 ? Int(h[i].timeIntervalSince(h[i - 1])) : nil) }
+            let rows: [SyncRow] = h.indices.reversed().prefix(5).map { i in
+                let prev: SyncEntry? = i > 0 ? h[i - 1] : nil
+                var delta: Double? = nil
+                if let a = h[i].sales, let b = prev?.sales { delta = a - b }
+                return SyncRow(at: h[i].at, sales: h[i].sales, delta: delta, gap: prev.map { Int(h[i].at.timeIntervalSince($0.at)) })
+            }
             ForEach(rows, id: \.at) { r in
+                let flat = r.delta.map { abs($0) < 0.005 } ?? false
                 HStack(spacing: 10) {
                     Text(ptTime(r.at)).frame(width: 64, alignment: .leading)
+                    Text(r.sales.map { money($0) } ?? "—").frame(width: 78, alignment: .trailing)
+                    Text(r.delta.map { deltaText($0) } ?? "—").frame(width: 70, alignment: .trailing)
+                        .foregroundColor(flat && inStoreWindow(r.at) ? .yellow : .secondary)
                     Text(r.gap.map { gapText($0) } ?? "—")
                 }.font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
             }
@@ -478,8 +513,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         m.miniOnline = hb.map { Date().timeIntervalSince($0) < 600 }
         m.heartbeatAt = hb
         m.sessionHours = num(r["session_age_hours"])
-        if let p = pull { m.record(p) }
         let state = (r["state"] as? String) ?? ""
+        m.signedOut = ((r["message"] as? String) ?? "").contains("SESSION_EXPIRED")
         m.runnerState = state
         m.runnerRunning = nil
         m.stateText = m.offHours ? "Off hours" : (m.level == 2 ? "No sync" : (state.isEmpty ? "Syncing" : (state == "polling" ? "Syncing" : state.capitalized)))
@@ -487,6 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         m.sales = num(s["net_sales"])
         m.checks = num(s["check_count"]).map { Int($0) }
         m.deltaPct = num(s["delta_pct"])
+        if let p = pull { m.record(p, sales: m.sales, checks: m.checks) }
         if let bd = s["business_date"] as? String {
             let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.timeZone = PT
             if let d = f.date(from: bd) { let g = DateFormatter(); g.timeZone = PT; g.dateFormat = "EEE"; m.weekdayName = g.string(from: d) }
@@ -500,11 +536,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func refreshLocal() {
         let running = sh("/usr/bin/pgrep", ["-f", "toast-live-runner.mjs"]).0 == 0
         let mtime = (try? FileManager.default.attributesOfItem(atPath: logPath))?[.modificationDate] as? Date
-        m.lastSync = mtime
         m.updatedAt = Date()
         m.miniOnline = running
         m.runnerRunning = running
-        if let t = mtime { m.record(t) }
+        var signedOut = false
         m.error = FileManager.default.fileExists(atPath: logPath) ? nil : "No runner log at ~/Toast-runner/logs"
         if let fh = FileHandle(forReadingAtPath: logPath) {
             let size = fh.seekToEndOfFile()
@@ -515,8 +550,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 m.sales = Double(g[1].replacingOccurrences(of: ",", with: "")); m.checks = Int(g[2])
             }
             if let g = firstMatch("session age ([0-9.]+)h", text) { m.sessionHours = Double(g[1]) }
+            // Signed out: newest error line (SESSION_EXPIRED / "Sign in by hand" / runner's ❌ marker) with no sales line after it.
+            let ns = text as NSString
+            func lastLoc(_ p: String) -> Int {
+                guard let re = try? NSRegularExpression(pattern: p),
+                      let mm = re.matches(in: text, range: NSRange(location: 0, length: ns.length)).last else { return -1 }
+                return mm.range.location
+            }
+            let errAt = lastLoc("SESSION_EXPIRED|Sign in by hand|\u{274C}")
+            let okAt = lastLoc("\\$[0-9][0-9,]*\\.?[0-9]* \\([0-9]+ checks\\)")
+            signedOut = errAt >= 0 && errAt > okAt
         }
-        m.stateText = !running ? "Runner not running" : (m.level == 2 ? "No sync" : "Syncing")
+        m.signedOut = signedOut
+        if signedOut {
+            m.lastSync = m.history.last?.at  // error writes touch the log but are not a sync
+        } else {
+            m.lastSync = mtime
+            if let t = mtime { m.record(t, sales: m.sales, checks: m.checks) }
+        }
+        m.stateText = !running ? "Runner not running" : signedOut ? "Signed out" : (m.level == 2 ? "No sync" : "Syncing")
         tick()
     }
 
