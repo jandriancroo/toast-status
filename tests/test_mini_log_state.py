@@ -91,16 +91,27 @@ def in_store_window(dt: datetime) -> bool:
     return POLL_START_MIN <= mins < POLL_END_MIN
 
 
+STORE_OPEN_MIN = 11 * 60
+STORE_CLOSE_MIN = 20 * 60
+
+
+def in_business_hours(dt: datetime) -> bool:
+    local = dt.astimezone(CT)
+    mins = local.hour * 60 + local.minute
+    return STORE_OPEN_MIN <= mins < STORE_CLOSE_MIN
+
+
 def window_start(dt: datetime) -> datetime:
     local = dt.astimezone(CT)
     return local.replace(hour=9, minute=0, second=0, microsecond=0)
 
 
 def next_open(dt: datetime) -> datetime:
-    open_ = window_start(dt)
-    if dt.astimezone(CT) >= open_:
-        open_ = open_ + timedelta(days=1)
-    return open_
+    local = dt.astimezone(CT)
+    today_open = local.replace(hour=11, minute=0, second=0, microsecond=0)
+    if local < today_open:
+        return today_open
+    return (today_open + timedelta(days=1))
 
 
 def closed_opens_text(dt: datetime) -> str:
@@ -136,7 +147,7 @@ def in_window_stale_secs(last: datetime, now: datetime) -> int:
 def status_word(signed_out: bool, now: datetime) -> str:
     if signed_out:
         return "Signed out"
-    if not in_store_window(now):
+    if not in_business_hours(now):
         return closed_opens_text(now)
     return "Online"
 
@@ -213,12 +224,12 @@ def main() -> None:
 
     # 11:30 PM CT Nov 10 (9:30 PM PT), after the runner's 11 PM CT close → next open Wed 9:00 AM CT
     night = datetime(2026, 11, 10, 23, 30, tzinfo=CT)
-    check("night status", status_word(False, night), "Closed · opens 9:00 AM Wed CT")
+    check("night status", status_word(False, night), "Closed · opens 11:00 AM Wed CT")
     check("night not signed out word", status_word(True, night), "Signed out")
 
     # 6:00 AM PT Nov 13 = 8:00 AM CT, before 9 AM CT open
     morning = datetime(2026, 11, 13, 6, 0, tzinfo=PT)
-    check("pre-open status", status_word(False, morning), "Closed · opens 9:00 AM CT")
+    check("pre-open status", status_word(False, morning), "Closed · opens 11:00 AM CT")
 
     # Healthy overnight overdue: last sync Tue 9:06 PM PT, now Wed 6:00 AM PT (if next day after a close)
     last = datetime(2026, 11, 10, 21, 6, tzinfo=PT)
@@ -233,6 +244,17 @@ def main() -> None:
 
     # Real expiry stays signed out overnight when it's still the newest event
     check("expiry still red at night", status_word(mini_log_signed_out(EXPIRED_NOV12, None), night), "Signed out")
+
+    # Store hours: 11 AM–8 PM CT, not the 9 AM poll start
+    ten_ct = datetime(2026, 11, 13, 10, 0, tzinfo=CT)
+    check("10 AM CT still closed, opens 11", status_word(False, ten_ct), "Closed · opens 11:00 AM CT")
+    check("10 AM CT not in business hours", in_business_hours(ten_ct), False)
+    check("10 AM CT is in runner poll window", in_store_window(ten_ct), True)
+    eleven_thirty = datetime(2026, 11, 13, 11, 30, tzinfo=CT)
+    check("11:30 AM CT is open (not Closed)", status_word(False, eleven_thirty), "Online")
+    after_close = datetime(2026, 11, 13, 20, 30, tzinfo=CT)  # 8:30 PM CT Friday
+    check("after 8 PM CT", status_word(False, after_close), "Closed · opens 11:00 AM Sat CT")
+
 
     if failed:
         print(f"\n{failed} FAILED")

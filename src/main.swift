@@ -7,7 +7,7 @@ import Security
 import CryptoKit
 import UserNotifications
 
-let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.2.1"
+let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.2.2"
 let RELEASES_API = "https://api.github.com/repos/jandriancroo/toast-status/releases/latest"
 let API = "https://lmodeiyrpwvgyqcvjkjr.supabase.co/functions/v1/toast-status"
 let CROOHQ_URL = "https://croohq.com"
@@ -112,12 +112,44 @@ func resumesText(_ d: Date = Date()) -> String {
     return "Resumes \(f.string(from: next)) \(shortTZ(TimeZone.current, next))"
 }
 
-// Next runner open in the store's local time (America/Chicago), e.g. "Closed · opens 9:00 AM CT" or "Closed · opens Sat 9:00 AM CT".
+// Coop's Hayward public hours in America/Chicago (Sun=0 … Sat=6).
+// Source: CrooHQ location_hours for 0d1477e5-791d-42f4-9245-ad8b2e75c41c
+// (all 7 days open 11:00–20:00, is_closed=false, updated 2026-09-28).
+// Google Maps-family listings (Facebook, Apple Maps, Yelp, popular times) agree: 11 AM–8 PM every day.
+// "Closed · opens …" uses these, not the runner poll window (9 AM–11 PM CT).
+struct DayHours { let openMin: Int; let closeMin: Int; let closed: Bool }
+let HAYWARD_HOURS: [DayHours] = Array(repeating: DayHours(openMin: 11 * 60, closeMin: 20 * 60, closed: false), count: 7)
+
+func sundayFirstWeekday(_ d: Date) -> Int {
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
+    return max(0, min(6, (cal.component(.weekday, from: d) - 1)))
+}
+func hoursOn(_ d: Date) -> DayHours { HAYWARD_HOURS[sundayFirstWeekday(d)] }
+
+func inBusinessHours(_ d: Date = Date()) -> Bool {
+    let h = hoursOn(d)
+    if h.closed { return false }
+    let m = ctMinutes(d)
+    if h.openMin <= h.closeMin { return m >= h.openMin && m < h.closeMin }
+    return m >= h.openMin || m < h.closeMin
+}
+
+func storeOpenDate(_ day: Date, minutes: Int) -> Date {
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
+    let start = cal.startOfDay(for: day)
+    return cal.date(byAdding: .minute, value: minutes, to: start) ?? start
+}
+
 func nextOpen(_ d: Date = Date()) -> Date {
     var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
-    var open = windowStart(d)
-    if d >= open { open = cal.date(byAdding: .day, value: 1, to: open) ?? open }
-    return open
+    for i in 0..<8 {
+        let day = cal.date(byAdding: .day, value: i, to: d) ?? d
+        let h = hoursOn(day)
+        if h.closed { continue }
+        let open = storeOpenDate(day, minutes: h.openMin)
+        if open > d { return open }
+    }
+    return storeOpenDate(d, minutes: 11 * 60)
 }
 func closedOpensText(_ d: Date = Date()) -> String {
     let open = nextOpen(d)
@@ -302,7 +334,8 @@ final class Model: ObservableObject {
     var wallStaleSecs: Int? { lastSync.map { Int(now.timeIntervalSince($0)) } }
     // Overdue uses only time inside 9 AM–11 PM CT, so a clean overnight close doesn't look 10–57h late.
     var staleSecs: Int? { lastSync.map { inWindowStaleSecs(from: $0, to: now) } }
-    var offHours: Bool { !inStoreWindow(now) }
+    var offHours: Bool { !inStoreWindow(now) }  // runner poll window 9 AM–11 PM CT
+    var storeClosed: Bool { !inBusinessHours(now) }  // public hours 11 AM–8 PM CT
     // Start-of-window grace: no sync yet today and still before 9:15 AM Chicago.
     var starting: Bool { inStartGrace(now) && (lastSync.map { $0 < windowStart(now) } ?? true) }
     // Mini heartbeat missing > 15 min during the poll window (after grace). Overnight this is just idle.
@@ -313,7 +346,7 @@ final class Model: ObservableObject {
     }
     var level: Int { // menu bar dot: 0 green, 1 yellow, 2 red, 3 gray (closed / starting), 4 mini asleep (non-alarming)
         if signedOut { return 2 }
-        if offHours || starting { return 3 }
+        if storeClosed || offHours || starting { return 3 }
         if miniAsleep { return 4 }
         guard let s = staleSecs else { return 2 }
         return s >= 900 ? 2 : (s >= 600 ? 1 : 0)
@@ -336,7 +369,7 @@ final class Model: ObservableObject {
     var statusWord: String {
         if restartPending || selfUpdating { return "Updating" }
         if signedOut { return "Signed out" }
-        if offHours { return closedOpensText(now) }
+        if storeClosed { return closedOpensText(now) }
         if starting { return "Starting up" }
         if miniAsleep { return "Mini asleep?" }
         if runnerDown || (staleSecs ?? Int.max) >= 900 { return "Offline" }
@@ -345,7 +378,7 @@ final class Model: ObservableObject {
     var statusSub: String? {
         if restartPending || selfUpdating { return nil }
         if signedOut { return "Run Sign In Once.command" }
-        if offHours { return nil }
+        if storeClosed { return nil }
         if starting { return "Waiting for first sync" }
         if miniAsleep { return heartbeatAt.map { "No heartbeat for \(ago(Int(now.timeIntervalSince($0))))" } ?? "No heartbeat yet" }
         return nil
@@ -379,11 +412,17 @@ struct SyncLog: View {
                 Text("Last check \(m.lastSync.map { ptTime($0) } ?? "—") · signed out")
                     .font(.system(size: 13, weight: .semibold)).foregroundColor(.red)
                 Text("Run Sign In Once.command").font(.system(size: 11)).foregroundColor(.secondary)
-            } else if m.offHours {
-                let lastCheck = m.lastSync.map { min($0, windowEnd($0)) }  // e.g. last pull ~9:00 PM PT
-                Text("Last check \(lastCheck.map { ptTime($0) } ?? "—") · alerts paused overnight")
-                    .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
-                Text("Runner polls 9 AM–11 PM CT · \(closedOpensText(m.now))").font(.system(size: 11)).foregroundColor(.secondary)
+            } else if m.storeClosed {
+                let lastCheck = m.lastSync.map { min($0, windowEnd($0)) }
+                if m.offHours {
+                    Text("Last check \(lastCheck.map { ptTime($0) } ?? "—") · alerts paused overnight")
+                        .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
+                    Text(closedOpensText(m.now)).font(.system(size: 11)).foregroundColor(.secondary)
+                } else {
+                    Text("Last check \(lastCheck.map { ptTime($0) } ?? "—")")
+                        .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
+                    Text(closedOpensText(m.now)).font(.system(size: 11)).foregroundColor(.secondary)
+                }
             } else if m.starting {
                 Text("Starting up · last check \(m.lastSync.map { ptTime($0) } ?? "—")")
                     .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
@@ -630,7 +669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         m.signedOut = msg.contains("SESSION_EXPIRED") || msg.contains("Sign in by hand")
         m.runnerState = state
         m.runnerRunning = nil
-        m.stateText = m.signedOut ? "Signed out" : (m.offHours ? closedOpensText(m.now) : (m.level == 2 ? "No sync" : (state.isEmpty ? "Syncing" : (state == "polling" ? "Syncing" : state.capitalized))))
+        m.stateText = m.signedOut ? "Signed out" : (m.storeClosed || m.offHours ? closedOpensText(m.now) : (m.level == 2 ? "No sync" : (state.isEmpty ? "Syncing" : (state == "polling" ? "Syncing" : state.capitalized))))
         let s = j["sales"] as? [String: Any] ?? [:]
         m.sales = num(s["net_sales"])
         m.checks = num(s["check_count"]).map { Int($0) }
@@ -676,7 +715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             m.lastSync = t
             if let t = t { m.record(t, sales: m.sales, checks: m.checks) }
         }
-        m.stateText = signedOut ? "Signed out" : (!running && m.offHours ? closedOpensText(m.now) : (!running ? "Runner not running" : (m.offHours ? closedOpensText(m.now) : (m.level == 2 ? "No sync" : "Syncing"))))
+        m.stateText = signedOut ? "Signed out" : (!running && (m.storeClosed || m.offHours) ? closedOpensText(m.now) : (!running ? "Runner not running" : (m.storeClosed || m.offHours ? closedOpensText(m.now) : (m.level == 2 ? "No sync" : "Syncing"))))
         tick()
     }
 
