@@ -7,7 +7,7 @@ import Security
 import CryptoKit
 import UserNotifications
 
-let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.2.2"
+let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.2.3"
 let RELEASES_API = "https://api.github.com/repos/jandriancroo/toast-status/releases/latest"
 let API = "https://lmodeiyrpwvgyqcvjkjr.supabase.co/functions/v1/toast-status"
 let CROOHQ_URL = "https://croohq.com"
@@ -344,21 +344,24 @@ final class Model: ObservableObject {
         guard let hb = heartbeatAt else { return true }
         return now.timeIntervalSince(hb) > 900
     }
-    var level: Int { // menu bar dot: 0 green, 1 yellow, 2 red, 3 gray (closed / starting), 4 mini asleep (non-alarming)
+    // Menu-bar and popover-header dots reflect runner connection/health only, never store open/closed.
+    // 0 green: session valid and runner working as expected (including closed hours: idle on purpose or still polling).
+    // 1 yellow/amber: overdue or stalled in the 9 AM–11 PM CT poll window, or an error.
+    // 2 red: signed out / SESSION_EXPIRED only.
+    var level: Int {
         if signedOut { return 2 }
-        if storeClosed || offHours || starting { return 3 }
-        if miniAsleep { return 4 }
-        guard let s = staleSecs else { return 2 }
-        return s >= 900 ? 2 : (s >= 600 ? 1 : 0)
+        if let err = error, !err.isEmpty { return 1 }
+        if offHours || starting { return 0 }
+        if miniAsleep || runnerDown { return 1 }
+        guard let s = staleSecs else { return 1 }
+        return s >= 600 ? 1 : 0
     }
-    static let grayBlue = Color(red: 0.55, green: 0.62, blue: 0.72)
-    static let asleepColor = Color(red: 0.62, green: 0.56, blue: 0.86)  // soft lavender: distinct, not an alarm
-    // Popover header dot: gray-blue off hours; menu bar uses plain gray via nsColor.
-    var color: Color { [Color.green, Color.yellow, Color.red, Model.grayBlue, Model.asleepColor][level] }
-    var nsColor: NSColor { [NSColor.systemGreen, .systemYellow, .systemRed, .systemGray, .systemPurple][level] }
+    var color: Color { [Color.green, Color.yellow, Color.red][level] }
+    var nsColor: NSColor { [NSColor.systemGreen, .systemYellow, .systemRed][level] }
     var staleColor: Color {
-        if level >= 3 { return .secondary }
-        guard let s = staleSecs else { return .red }; return s >= 900 ? .red : (s >= 600 ? .yellow : .primary)
+        if offHours || starting { return .secondary }
+        guard let s = staleSecs else { return .yellow }
+        return s >= 600 ? .yellow : .primary
     }
 
     var runnerDown: Bool {
@@ -384,11 +387,8 @@ final class Model: ObservableObject {
         return nil
     }
     var glow: Color {
-        if statusWord.hasPrefix("Closed") || statusWord == "Starting up" { return .gray }
-        if statusWord == "Mini asleep?" { return Model.asleepColor }
-        if statusWord == "Offline" || statusWord == "Signed out" { return .red }
-        if statusWord == "Updating" || (staleSecs ?? 0) >= 600 { return .yellow }
-        return .green
+        if statusWord == "Updating" { return .yellow }
+        return [Color.green, Color.yellow, Color.red][level]
     }
 }
 
@@ -412,21 +412,16 @@ struct SyncLog: View {
                 Text("Last check \(m.lastSync.map { ptTime($0) } ?? "—") · signed out")
                     .font(.system(size: 13, weight: .semibold)).foregroundColor(.red)
                 Text("Run Sign In Once.command").font(.system(size: 11)).foregroundColor(.secondary)
-            } else if m.storeClosed {
+            } else if m.offHours {
                 let lastCheck = m.lastSync.map { min($0, windowEnd($0)) }
-                if m.offHours {
-                    Text("Last check \(lastCheck.map { ptTime($0) } ?? "—") · alerts paused overnight")
-                        .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
-                    Text(closedOpensText(m.now)).font(.system(size: 11)).foregroundColor(.secondary)
-                } else {
-                    Text("Last check \(lastCheck.map { ptTime($0) } ?? "—")")
-                        .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
-                    Text(closedOpensText(m.now)).font(.system(size: 11)).foregroundColor(.secondary)
-                }
+                Text("Last check \(lastCheck.map { ptTime($0) } ?? "—") · alerts paused overnight")
+                    .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
+                if m.storeClosed { Text(closedOpensText(m.now)).font(.system(size: 11)).foregroundColor(.secondary) }
             } else if m.starting {
                 Text("Starting up · last check \(m.lastSync.map { ptTime($0) } ?? "—")")
                     .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
                 Text("Grace until 9:15 AM CT").font(.system(size: 11)).foregroundColor(.secondary)
+                if m.storeClosed { Text(closedOpensText(m.now)).font(.system(size: 11)).foregroundColor(.secondary) }
             } else if let l = m.lastSync {
                 let base = l < windowStart(m.now) ? windowStart(m.now) : l
                 let due = base.addingTimeInterval(300)
@@ -435,8 +430,10 @@ struct SyncLog: View {
                     .font(.system(size: 13, weight: .semibold)).foregroundColor(m.staleColor)
                 Text(left >= 0 ? "due in \(ago(left)) · last sync \(ago(m.wallStaleSecs ?? 0)) ago" : "overdue by \(ago(-left)) · last sync \(ago(m.wallStaleSecs ?? 0)) ago")
                     .font(.system(size: 11)).foregroundColor(.secondary)
+                if m.storeClosed { Text(closedOpensText(m.now)).font(.system(size: 11)).foregroundColor(.secondary) }
             } else {
                 Text("Last check — never").font(.system(size: 13, weight: .semibold)).foregroundColor(.red)
+                if m.storeClosed { Text(closedOpensText(m.now)).font(.system(size: 11)).foregroundColor(.secondary) }
             }
             let h = m.history
             let rows: [SyncRow] = h.indices.reversed().prefix(5).map { i in
@@ -599,7 +596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         t.append(NSAttributedString(string: "Toast"))
         item.button?.attributedTitle = t
         // stale notification: > 15 min during store window, once per stale episode
-        if m.level == 2, inStoreWindow(m.now), !m.starting, let s = m.staleSecs, s > 900 {
+        if !m.signedOut, inStoreWindow(m.now), !m.starting, let s = m.staleSecs, s > 900 {
             if !notifiedStale { notifiedStale = true; notify("Toast sync is stale", "Last sync \(ago(s)) ago at \(m.locationName).") }
         } else if m.level == 0 { notifiedStale = false }
     }
@@ -669,7 +666,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         m.signedOut = msg.contains("SESSION_EXPIRED") || msg.contains("Sign in by hand")
         m.runnerState = state
         m.runnerRunning = nil
-        m.stateText = m.signedOut ? "Signed out" : (m.storeClosed || m.offHours ? closedOpensText(m.now) : (m.level == 2 ? "No sync" : (state.isEmpty ? "Syncing" : (state == "polling" ? "Syncing" : state.capitalized))))
+        m.stateText = m.signedOut ? "Signed out" : (m.storeClosed || m.offHours ? closedOpensText(m.now) : ((m.staleSecs ?? Int.max) >= 900 ? "No sync" : (state.isEmpty ? "Syncing" : (state == "polling" ? "Syncing" : state.capitalized))))
         let s = j["sales"] as? [String: Any] ?? [:]
         m.sales = num(s["net_sales"])
         m.checks = num(s["check_count"]).map { Int($0) }
@@ -715,7 +712,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             m.lastSync = t
             if let t = t { m.record(t, sales: m.sales, checks: m.checks) }
         }
-        m.stateText = signedOut ? "Signed out" : (!running && (m.storeClosed || m.offHours) ? closedOpensText(m.now) : (!running ? "Runner not running" : (m.storeClosed || m.offHours ? closedOpensText(m.now) : (m.level == 2 ? "No sync" : "Syncing"))))
+        m.stateText = signedOut ? "Signed out" : (!running && (m.storeClosed || m.offHours) ? closedOpensText(m.now) : (!running ? "Runner not running" : (m.storeClosed || m.offHours ? closedOpensText(m.now) : ((m.staleSecs ?? Int.max) >= 900 ? "No sync" : "Syncing"))))
         tick()
     }
 

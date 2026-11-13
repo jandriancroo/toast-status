@@ -1,7 +1,7 @@
 # Toast Status v3 (Coop's Pizza · Hayward)
 1. Unzip, then double-click `Install Toast Status.command` (right-click > Open the first time).
 2. Pick 1 on the Mac mini, 2 on a remote Mac (Mac Studio). Paste that Mac's token when asked (mini token on the mini, studio token on the Studio). It is stored only in the login Keychain.
-3. Click "● Toast" in the menu bar. Dot / timer: yellow at 10 min, red at 15 min, gray when the store is closed (Closed · opens 11:00 AM CT). Store hours are 11 AM–8 PM CT every day; the runner still polls 9 AM–11 PM CT. A notification fires when the sync is > 15 min stale in store hours.
+3. Click "● Toast" in the menu bar. The menu-bar and popover-header dots show runner connection and health only, never whether the store is open or closed: green when the session is valid and the runner is working as expected (including closed hours, when it is idle on purpose or still polling); yellow/amber when the runner is overdue or stalled during the 9 AM–11 PM CT poll window, or there is an error; red only when signed out or SESSION_EXPIRED. Closed · opens 11:00 AM CT is popover text only. Store hours are 11 AM–8 PM CT every day; the runner still polls 9 AM–11 PM CT. A notification fires when the sync is > 15 min stale in the poll window.
 - Mini mode: reads ~/Toast-runner/logs/runner.out.log; Restart = launchctl kickstart of com.croo.toast-runner; polls CrooHQ every 30s for remote restart requests and acknowledges them. (The mini token can only see restart requests, so labor % appears on remote Macs only.)
 - Remote mode: reads CrooHQ toast-status; Restart sends a request the mini executes within ~30s (max 1 per 5 min).
 - Self-update: checks GitHub releases (jandriancroo/toast-status, latest) every 6h and when opened, verifies sha256, rebuilds, swaps ~/Applications/Toast Status.app, relaunches.
@@ -17,3 +17,6 @@ Remove: `Uninstall Toast Status.command` (also deletes the Keychain token). The 
 
 ## v3.2.2
 - **Closed · opens** uses Coop's Hayward's public hours from CrooHQ (`location_hours`: 11:00 AM–8:00 PM CT every day), not the runner's 9 AM poll start. Google Maps-family listings agree. The runner poll window is unchanged.
+
+## v3.2.3
+- The menu-bar and popover-header dots follow runner health only: green for a valid session (including overnight idle or in-window polling), amber if the runner is overdue/stalled in the 9 AM–11 PM CT poll window or there is an error, and red only for signed out / `SESSION_EXPIRED`. **Closed · opens 11:00 AM CT** stays popover text. The runner and its poll window are unchanged.

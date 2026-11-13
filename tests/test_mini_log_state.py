@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mirrors Toast Status 3.2.1 mini-log verdicts and closed-hours display.
+"""Mirrors Toast Status 3.2.3 mini-log verdicts, closed-hours text, and runner-health dots.
 Keep these patterns and rules in lockstep with src/main.swift (miniLogSignedOut,
 miniLogCleanClosed, inWindowStaleSecs, closedOpensText).
 """
@@ -152,6 +152,46 @@ def status_word(signed_out: bool, now: datetime) -> str:
     return "Online"
 
 
+GRACE_MIN = 15
+
+
+def in_start_grace(dt: datetime) -> bool:
+    local = dt.astimezone(CT)
+    mins = local.hour * 60 + local.minute
+    return POLL_START_MIN <= mins < POLL_START_MIN + GRACE_MIN
+
+
+def is_starting(now: datetime, last_sync: datetime | None) -> bool:
+    if not in_start_grace(now):
+        return False
+    if last_sync is None:
+        return True
+    return last_sync < window_start(now)
+
+
+def dot_level(
+    signed_out: bool,
+    now: datetime,
+    last_sync: datetime | None,
+    error: str | None = None,
+    runner_down: bool = False,
+    mini_asleep: bool = False,
+) -> int:
+    """0 green, 1 amber, 2 red. Never uses store open/closed."""
+    if signed_out:
+        return 2
+    if error:
+        return 1
+    off_hours = not in_store_window(now)
+    if off_hours or is_starting(now, last_sync):
+        return 0
+    if mini_asleep or runner_down:
+        return 1
+    if last_sync is None:
+        return 1
+    return 1 if in_window_stale_secs(last_sync, now) >= 600 else 0
+
+
 # --- samples from 2026-11-13 ---
 
 EXPIRED_NOV12 = """
@@ -255,6 +295,27 @@ def main() -> None:
     after_close = datetime(2026, 11, 13, 20, 30, tzinfo=CT)  # 8:30 PM CT Friday
     check("after 8 PM CT", status_word(False, after_close), "Closed · opens 11:00 AM Sat CT")
 
+    # v3.2.3: dots follow runner health only (0 green, 1 amber, 2 red)
+    night_last = datetime(2026, 11, 10, 21, 6, tzinfo=PT)  # Tue 9:06 PM PT, after close
+    check("overnight healthy session is green", dot_level(False, night, night_last), 0)
+    check("overnight still shows Closed text", status_word(False, night).startswith("Closed · opens"), True)
+    check("expired is red overnight", dot_level(True, night, night_last), 2)
+    check("expired stays Signed out text", status_word(True, night), "Signed out")
+    stalled_now = datetime(2026, 11, 13, 12, 0, tzinfo=CT)  # Friday noon, in poll window and store open
+    stalled_last = stalled_now - timedelta(minutes=20)
+    check("stalled in poll window is amber", dot_level(False, stalled_now, stalled_last), 1)
+    recent_last = stalled_now - timedelta(minutes=3)
+    check("healthy mid-day poll is green", dot_level(False, stalled_now, recent_last), 0)
+    # 10 AM CT: store closed, runner still polling
+    ten_last = ten_ct - timedelta(minutes=3)
+    check("10 AM CT closed text but green dot if polling", status_word(False, ten_ct), "Closed · opens 11:00 AM CT")
+    check("10 AM CT healthy poll is green", dot_level(False, ten_ct, ten_last), 0)
+    ten_stalled = datetime(2026, 11, 13, 10, 30, tzinfo=CT)
+    ten_old = datetime(2026, 11, 12, 22, 0, tzinfo=CT)  # previous close; stale from 9 AM is 90 min
+    check("10:30 AM CT stalled poll is amber", dot_level(False, ten_stalled, ten_old), 1)
+    # start grace 9:05 AM CT after overnight close should stay green
+    grace = datetime(2026, 11, 13, 9, 5, tzinfo=CT)
+    check("9:05 AM CT start grace is green", dot_level(False, grace, night_last), 0)
 
     if failed:
         print(f"\n{failed} FAILED")
