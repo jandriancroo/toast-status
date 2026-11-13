@@ -7,7 +7,7 @@ import Security
 import CryptoKit
 import UserNotifications
 
-let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.1.0"
+let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.2.1"
 let RELEASES_API = "https://api.github.com/repos/jandriancroo/toast-status/releases/latest"
 let API = "https://lmodeiyrpwvgyqcvjkjr.supabase.co/functions/v1/toast-status"
 let CROOHQ_URL = "https://croohq.com"
@@ -19,6 +19,7 @@ let configPath = supportDir + "/config.plist"
 let appPath = home + "/Applications/Toast Status.app"
 let runnerDir = home + "/Toast-runner"
 let logPath = runnerDir + "/logs/runner.out.log"
+let sessionStampPath = runnerDir + "/.toast-session-saved-at"  // read-only; never write, never read the session cookies
 let runNowPath = runnerDir + "/Run Now.command"
 let runnerLabel = "com.croo.toast-runner"
 let PT = TimeZone(identifier: "America/Los_Angeles")!
@@ -77,15 +78,16 @@ func ago(_ secs: Int) -> String {
     if s >= 3600 { return "\(s / 3600)h \(String(format: "%02d", (s % 3600) / 60))m" }
     return "\(s / 60)m \(String(format: "%02d", s % 60))s"
 }
-// Runner poll window: 6:00 AM – 11:00 PM America/Chicago (= 4 AM – 9 PM PT). Outside it the runner is idle by design.
-let POLL_START_MIN = 6 * 60, POLL_END_MIN = 23 * 60, GRACE_MIN = 15
+// Runner poll window: 9:00 AM – 11:00 PM America/Chicago (= 7 AM – 9 PM PT).
+// Matches the Hayward runner's POLL_START_LOCAL / POLL_END_LOCAL. The widget only displays this; it never starts or stops the runner.
+let POLL_START_MIN = 9 * 60, POLL_END_MIN = 23 * 60, GRACE_MIN = 15
 func ctMinutes(_ d: Date) -> Int {
     var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
     let c = cal.dateComponents([.hour, .minute], from: d)
     return (c.hour ?? 0) * 60 + (c.minute ?? 0)
 }
 func inStoreWindow(_ d: Date = Date()) -> Bool { let m = ctMinutes(d); return m >= POLL_START_MIN && m < POLL_END_MIN }
-// Today's window start (6:00 AM Chicago) as an absolute Date.
+// Today's window start (9:00 AM Chicago) as an absolute Date.
 func windowStart(_ d: Date = Date()) -> Date {
     var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
     return cal.date(bySettingHour: POLL_START_MIN / 60, minute: 0, second: 0, of: d) ?? d
@@ -95,19 +97,121 @@ func windowEnd(_ d: Date = Date()) -> Date {
     var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
     return cal.date(bySettingHour: POLL_END_MIN / 60, minute: 0, second: 0, of: d) ?? d
 }
-// First 15 min of the window (6:00–6:15 AM Chicago): no red yet while the runner starts.
+// First 15 min of the window (9:00–9:15 AM Chicago): no red yet while the runner starts.
 func inStartGrace(_ d: Date = Date()) -> Bool { let m = ctMinutes(d); return m >= POLL_START_MIN && m < POLL_START_MIN + GRACE_MIN }
 func shortTZ(_ tz: TimeZone, _ d: Date) -> String {
     let abbr = tz.abbreviation(for: d) ?? ""
     return abbr.hasPrefix("P") && abbr.hasSuffix("T") ? "PT" : (abbr.hasPrefix("C") && abbr.hasSuffix("T") ? "CT" : abbr)
 }
-// Next 6:00 AM Chicago, shown in this Mac's local time zone, e.g. "Resumes 4:00 AM PT".
+// Next 9:00 AM Chicago, shown in this Mac's local time zone (legacy wording).
 func resumesText(_ d: Date = Date()) -> String {
     var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
     var next = windowStart(d)
     if next <= d { next = cal.date(byAdding: .day, value: 1, to: next) ?? next }
     let f = DateFormatter(); f.timeZone = TimeZone.current; f.dateFormat = "h:mm a"
     return "Resumes \(f.string(from: next)) \(shortTZ(TimeZone.current, next))"
+}
+
+// Next runner open in the store's local time (America/Chicago), e.g. "Closed · opens 9:00 AM CT" or "Closed · opens Sat 9:00 AM CT".
+func nextOpen(_ d: Date = Date()) -> Date {
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
+    var open = windowStart(d)
+    if d >= open { open = cal.date(byAdding: .day, value: 1, to: open) ?? open }
+    return open
+}
+func closedOpensText(_ d: Date = Date()) -> String {
+    let open = nextOpen(d)
+    let timeF = DateFormatter(); timeF.timeZone = CT; timeF.dateFormat = "h:mm a"
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
+    var day = ""
+    if !cal.isDate(open, inSameDayAs: d) {
+        let dayF = DateFormatter(); dayF.timeZone = CT; dayF.dateFormat = "EEE"
+        day = " \(dayF.string(from: open))"
+    }
+    return "Closed · opens \(timeF.string(from: open))\(day) CT"
+}
+
+// Elapsed time that falls inside 9:00 AM–11:00 PM CT, so overnight closed hours don't count as overdue.
+func inWindowStaleSecs(from last: Date, to now: Date) -> Int {
+    if now <= last { return 0 }
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = CT
+    var total: TimeInterval = 0
+    var day = cal.startOfDay(for: last)
+    let lastDay = cal.startOfDay(for: now)
+    while day <= lastDay {
+        let open = cal.date(bySettingHour: POLL_START_MIN / 60, minute: 0, second: 0, of: day) ?? day
+        let close = cal.date(bySettingHour: POLL_END_MIN / 60, minute: 0, second: 0, of: day) ?? day
+        let lo = max(last, open)
+        let hi = min(now, close)
+        if hi > lo { total += hi.timeIntervalSince(lo) }
+        guard let nxt = cal.date(byAdding: .day, value: 1, to: day) else { break }
+        day = nxt
+    }
+    return Int(total)
+}
+
+func lastLoc(_ pattern: String, in text: String) -> Int {
+    guard let re = try? NSRegularExpression(pattern: pattern) else { return -1 }
+    let ns = text as NSString
+    guard let mm = re.matches(in: text, range: NSRange(location: 0, length: ns.length)).last else { return -1 }
+    return mm.range.location
+}
+
+let EXPIRY_PAT = "SESSION_EXPIRED|Sign in by hand"
+let GOOD_PAT = "\\$[0-9][0-9,]*\\.?[0-9]* \\([0-9]+ checks\\)|reused saved Toast sign-in|session-only — no password login"
+let CLOSED_PAT = "store closed for the day|all stores closed"
+
+func parseRunnerStartDate(_ raw: String) -> Date? {
+    let iso = parseDate(raw)
+    if let iso = iso { return iso }
+    let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "EEE MMM d HH:mm:ss z yyyy"
+    return f.date(from: raw)
+}
+
+// Timestamp of the "==== … start ====" or launchd line immediately before `before`.
+func lastStartTime(in text: String, before: Int) -> Date? {
+    let ns = text as NSString
+    let prefix = ns.substring(to: max(0, min(before, ns.length)))
+    var best: (Int, Date)? = nil
+    let pats: [(String, Int)] = [
+        ("==== ([A-Za-z]{3} [A-Za-z]{3} [0-9]{1,2} [0-9:]{8} [A-Z]{3,4} [0-9]{4}) start ====", 1),
+        ("([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z) launchd opened", 1),
+    ]
+    for (p, g) in pats {
+        guard let re = try? NSRegularExpression(pattern: p) else { continue }
+        for m in re.matches(in: prefix, range: NSRange(location: 0, length: (prefix as NSString).length)) {
+            let r = m.range(at: g)
+            if r.location == NSNotFound { continue }
+            let raw = (prefix as NSString).substring(with: r)
+            if let d = parseRunnerStartDate(raw) {
+                if best == nil || m.range.location > best!.0 { best = (m.range.location, d) }
+            }
+        }
+    }
+    return best?.1
+}
+
+func readSessionSavedAt() -> Date? {
+    guard let raw = try? String(contentsOfFile: sessionStampPath, encoding: .utf8) else { return nil }
+    return parseDate(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+// Red Signed out only when a real SESSION_EXPIRED / "Sign in by hand" is newer than the last good sales, session reuse, or session-save stamp.
+func miniLogSignedOut(_ text: String, sessionSavedAt: Date?) -> Bool {
+    let errAt = lastLoc(EXPIRY_PAT, in: text)
+    if errAt < 0 { return false }
+    let goodAt = lastLoc(GOOD_PAT, in: text)
+    if goodAt > errAt { return false }
+    if let saved = sessionSavedAt, let errStart = lastStartTime(in: text, before: errAt), saved > errStart { return false }
+    return true
+}
+
+func miniLogCleanClosed(_ text: String) -> Bool {
+    let closedAt = lastLoc(CLOSED_PAT, in: text)
+    if closedAt < 0 { return false }
+    let errAt = lastLoc(EXPIRY_PAT, in: text)
+    let goodAt = lastLoc(GOOD_PAT, in: text)
+    return closedAt > errAt && closedAt > goodAt
 }
 func versionIsNewer(_ a: String, than b: String) -> Bool {
     let pa = a.split(separator: ".").map { Int($0) ?? 0 }, pb = b.split(separator: ".").map { Int($0) ?? 0 }
@@ -195,9 +299,11 @@ final class Model: ObservableObject {
         UserDefaults.standard.set(enc, forKey: HIST_KEY)
     }
 
-    var staleSecs: Int? { lastSync.map { Int(now.timeIntervalSince($0)) } }
+    var wallStaleSecs: Int? { lastSync.map { Int(now.timeIntervalSince($0)) } }
+    // Overdue uses only time inside 9 AM–11 PM CT, so a clean overnight close doesn't look 10–57h late.
+    var staleSecs: Int? { lastSync.map { inWindowStaleSecs(from: $0, to: now) } }
     var offHours: Bool { !inStoreWindow(now) }
-    // Start-of-window grace: no sync yet today and still before 6:15 AM Chicago.
+    // Start-of-window grace: no sync yet today and still before 9:15 AM Chicago.
     var starting: Bool { inStartGrace(now) && (lastSync.map { $0 < windowStart(now) } ?? true) }
     // Mini heartbeat missing > 15 min during the poll window (after grace). Overnight this is just idle.
     var miniAsleep: Bool {
@@ -205,7 +311,8 @@ final class Model: ObservableObject {
         guard let hb = heartbeatAt else { return true }
         return now.timeIntervalSince(hb) > 900
     }
-    var level: Int { // menu bar dot: 0 green, 1 yellow, 2 red, 3 gray (off hours / starting), 4 mini asleep (non-alarming)
+    var level: Int { // menu bar dot: 0 green, 1 yellow, 2 red, 3 gray (closed / starting), 4 mini asleep (non-alarming)
+        if signedOut { return 2 }
         if offHours || starting { return 3 }
         if miniAsleep { return 4 }
         guard let s = staleSecs else { return 2 }
@@ -228,23 +335,23 @@ final class Model: ObservableObject {
     // Mac mini card: word + glow
     var statusWord: String {
         if restartPending || selfUpdating { return "Updating" }
-        if offHours { return "Off hours" }
+        if signedOut { return "Signed out" }
+        if offHours { return closedOpensText(now) }
         if starting { return "Starting up" }
         if miniAsleep { return "Mini asleep?" }
-        if signedOut { return "Signed out" }
         if runnerDown || (staleSecs ?? Int.max) >= 900 { return "Offline" }
         return "Online"
     }
     var statusSub: String? {
         if restartPending || selfUpdating { return nil }
-        if offHours { return resumesText(now) }
+        if signedOut { return "Run Sign In Once.command" }
+        if offHours { return nil }
         if starting { return "Waiting for first sync" }
         if miniAsleep { return heartbeatAt.map { "No heartbeat for \(ago(Int(now.timeIntervalSince($0))))" } ?? "No heartbeat yet" }
-        if signedOut { return "Run Sign In Once.command" }
         return nil
     }
     var glow: Color {
-        if statusWord == "Off hours" || statusWord == "Starting up" { return .gray }
+        if statusWord.hasPrefix("Closed") || statusWord == "Starting up" { return .gray }
         if statusWord == "Mini asleep?" { return Model.asleepColor }
         if statusWord == "Offline" || statusWord == "Signed out" { return .red }
         if statusWord == "Updating" || (staleSecs ?? 0) >= 600 { return .yellow }
@@ -268,21 +375,26 @@ struct SyncLog: View {
     @ObservedObject var m: Model
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            if m.offHours {
+            if m.signedOut {
+                Text("Last check \(m.lastSync.map { ptTime($0) } ?? "—") · signed out")
+                    .font(.system(size: 13, weight: .semibold)).foregroundColor(.red)
+                Text("Run Sign In Once.command").font(.system(size: 11)).foregroundColor(.secondary)
+            } else if m.offHours {
                 let lastCheck = m.lastSync.map { min($0, windowEnd($0)) }  // e.g. last pull ~9:00 PM PT
                 Text("Last check \(lastCheck.map { ptTime($0) } ?? "—") · alerts paused overnight")
                     .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
-                Text("Runner polls 6 AM–11 PM CT · \(resumesText(m.now))").font(.system(size: 11)).foregroundColor(.secondary)
+                Text("Runner polls 9 AM–11 PM CT · \(closedOpensText(m.now))").font(.system(size: 11)).foregroundColor(.secondary)
             } else if m.starting {
                 Text("Starting up · last check \(m.lastSync.map { ptTime($0) } ?? "—")")
                     .font(.system(size: 13, weight: .semibold)).foregroundColor(.secondary)
-                Text("Grace until 6:15 AM CT").font(.system(size: 11)).foregroundColor(.secondary)
+                Text("Grace until 9:15 AM CT").font(.system(size: 11)).foregroundColor(.secondary)
             } else if let l = m.lastSync {
-                let due = l.addingTimeInterval(300)
+                let base = l < windowStart(m.now) ? windowStart(m.now) : l
+                let due = base.addingTimeInterval(300)
                 let left = Int(due.timeIntervalSince(m.now))
                 Text("Last check \(ptTime(l)) · next due \(ptTime(due))")
                     .font(.system(size: 13, weight: .semibold)).foregroundColor(m.staleColor)
-                Text(left >= 0 ? "due in \(ago(left)) · last sync \(ago(m.staleSecs ?? 0)) ago" : "overdue by \(ago(-left)) · last sync \(ago(m.staleSecs ?? 0)) ago")
+                Text(left >= 0 ? "due in \(ago(left)) · last sync \(ago(m.wallStaleSecs ?? 0)) ago" : "overdue by \(ago(-left)) · last sync \(ago(m.wallStaleSecs ?? 0)) ago")
                     .font(.system(size: 11)).foregroundColor(.secondary)
             } else {
                 Text("Last check — never").font(.system(size: 13, weight: .semibold)).foregroundColor(.red)
@@ -514,10 +626,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         m.heartbeatAt = hb
         m.sessionHours = num(r["session_age_hours"])
         let state = (r["state"] as? String) ?? ""
-        m.signedOut = ((r["message"] as? String) ?? "").contains("SESSION_EXPIRED")
+        let msg = (r["message"] as? String) ?? ""
+        m.signedOut = msg.contains("SESSION_EXPIRED") || msg.contains("Sign in by hand")
         m.runnerState = state
         m.runnerRunning = nil
-        m.stateText = m.offHours ? "Off hours" : (m.level == 2 ? "No sync" : (state.isEmpty ? "Syncing" : (state == "polling" ? "Syncing" : state.capitalized)))
+        m.stateText = m.signedOut ? "Signed out" : (m.offHours ? closedOpensText(m.now) : (m.level == 2 ? "No sync" : (state.isEmpty ? "Syncing" : (state == "polling" ? "Syncing" : state.capitalized))))
         let s = j["sales"] as? [String: Any] ?? [:]
         m.sales = num(s["net_sales"])
         m.checks = num(s["check_count"]).map { Int($0) }
@@ -550,25 +663,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 m.sales = Double(g[1].replacingOccurrences(of: ",", with: "")); m.checks = Int(g[2])
             }
             if let g = firstMatch("session age ([0-9.]+)h", text) { m.sessionHours = Double(g[1]) }
-            // Signed out: newest error line (SESSION_EXPIRED / "Sign in by hand" / runner's ❌ marker) with no sales line after it.
-            let ns = text as NSString
-            func lastLoc(_ p: String) -> Int {
-                guard let re = try? NSRegularExpression(pattern: p),
-                      let mm = re.matches(in: text, range: NSRange(location: 0, length: ns.length)).last else { return -1 }
-                return mm.range.location
-            }
-            let errAt = lastLoc("SESSION_EXPIRED|Sign in by hand|\u{274C}")
-            let okAt = lastLoc("\\$[0-9][0-9,]*\\.?[0-9]* \\([0-9]+ checks\\)")
-            signedOut = errAt >= 0 && errAt > okAt
+            // Signed out only if a real SESSION_EXPIRED / "Sign in by hand" is newer than a sales line, a reused session, or a session-save stamp.
+            let savedAt = readSessionSavedAt()
+            signedOut = miniLogSignedOut(text, sessionSavedAt: savedAt)
         }
         m.signedOut = signedOut
         if signedOut {
             m.lastSync = m.history.last?.at  // error writes touch the log but are not a sync
         } else {
-            m.lastSync = mtime
-            if let t = mtime { m.record(t, sales: m.sales, checks: m.checks) }
+            let candidates = [mtime, readSessionSavedAt()].compactMap { $0 }
+            let t = candidates.max()
+            m.lastSync = t
+            if let t = t { m.record(t, sales: m.sales, checks: m.checks) }
         }
-        m.stateText = !running ? "Runner not running" : signedOut ? "Signed out" : (m.level == 2 ? "No sync" : "Syncing")
+        m.stateText = signedOut ? "Signed out" : (!running && m.offHours ? closedOpensText(m.now) : (!running ? "Runner not running" : (m.offHours ? closedOpensText(m.now) : (m.level == 2 ? "No sync" : "Syncing"))))
         tick()
     }
 
