@@ -1,13 +1,14 @@
-// Toast Status v3.2 — menu bar monitor for the Coop's Hayward Toast sync runner.
+// Toast Status v3.2.4 — menu bar monitor for the Coop's Hayward Toast sync runner.
 // One app, two modes (set by the installer): "mini" (local, on the Mac mini) or "remote" (e.g. Mac Studio).
 // The status token lives only in the login Keychain (service com.croo.toast-status).
 import Cocoa
 import SwiftUI
+import Combine
 import Security
 import CryptoKit
 import UserNotifications
 
-let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.2.3"
+let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "3.2.4"
 let RELEASES_API = "https://api.github.com/repos/jandriancroo/toast-status/releases/latest"
 let API = "https://lmodeiyrpwvgyqcvjkjr.supabase.co/functions/v1/toast-status"
 let CROOHQ_URL = "https://croohq.com"
@@ -549,9 +550,36 @@ struct PopView: View {
 }
 
 // MARK: app
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+// v3.2.4: borderless floating panel instead of NSPopover. NSPopover can only slide so far from its
+// arrow, so a 600pt popover anchored near the right edge of a 13" Air (1470x956) got cut off.
+// The panel is positioned under the menu bar icon and clamped inside screen.visibleFrame.
+final class StatusPanel: NSPanel {
+    var onEscape: (() -> Void)?
+    convenience init() {
+        self.init(contentRect: NSRect(x: 0, y: 0, width: 600, height: 500),
+                  styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        isFloatingPanel = true
+        level = .statusBar
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        isMovable = false
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+    }
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+    override func cancelOperation(_ sender: Any?) { onEscape?() }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let popover = NSPopover()
+    let panel = StatusPanel()
+    var hosting: NSHostingView<PopView>?
+    var monitors: [Any] = []
+    var lastPanelClose = Date.distantPast
+    var modelSub: Any?
     let m = Model()
     var timers: [Timer] = []
     var notifiedStale = false
@@ -562,13 +590,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let v = PopView(m: m, restart: { [weak self] in self?.restartTapped() },
-                        openHQ: { NSWorkspace.shared.open(URL(string: CROOHQ_URL)!) },
+                        openHQ: { [weak self] in self?.closePanel(); NSWorkspace.shared.open(URL(string: CROOHQ_URL)!) },
                         runUpdate: { [weak self] in self?.applyUpdate() },
                         quit: { NSApp.terminate(nil) },
                         updateButton: { [weak self] in self?.updateButtonTapped() })
-        popover.contentViewController = NSHostingController(rootView: v)
-        popover.behavior = .transient
-        popover.delegate = self
+        setupPanel(v)
         item.button?.target = self
         item.button?.action = #selector(togglePopover)
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
@@ -582,13 +608,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    @objc func togglePopover() {
-        guard let b = item.button else { return }
-        if popover.isShown { popover.performClose(nil); return }
-        refresh(); checkForUpdate()
-        popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
-        NSApp.activate(ignoringOtherApps: true)
+    func setupPanel(_ v: PopView) {
+        let fx = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 600, height: 500))
+        fx.material = .popover
+        fx.blendingMode = .behindWindow
+        fx.state = .active
+        fx.wantsLayer = true
+        fx.layer?.cornerRadius = 14
+        fx.layer?.masksToBounds = true
+        fx.layer?.borderWidth = 1
+        fx.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        let h = NSHostingView(rootView: v)
+        h.sizingOptions = [.intrinsicContentSize]
+        h.frame = fx.bounds
+        h.autoresizingMask = [.width, .height]
+        fx.addSubview(h)
+        panel.contentView = fx
+        panel.delegate = self
+        panel.onEscape = { [weak self] in self?.closePanel() }
+        hosting = h
+        NotificationCenter.default.addObserver(self, selector: #selector(appResigned),
+                                               name: NSApplication.didResignActiveNotification, object: nil)
+        // Keep the panel's top pinned under the menu bar when rows/error/flash change its height.
+        modelSub = m.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.repositionPanel() }
+        }
     }
+
+    // Name kept from the NSPopover days; it now toggles the floating panel.
+    @objc func togglePopover() {
+        if panel.isVisible { closePanel(); return }
+        // The outside-click monitor may have just closed it on this same click; don't reopen.
+        if Date().timeIntervalSince(lastPanelClose) < 0.25 { return }
+        refresh(); checkForUpdate()
+        repositionPanel()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        addMonitors()
+    }
+
+    func repositionPanel() {
+        guard let h = hosting, let b = item.button, let btnWin = b.window else { return }
+        let screen = btnWin.screen ?? NSScreen.main ?? NSScreen.screens[0]
+        let vis = screen.visibleFrame
+        let btnRect = btnWin.convertToScreen(b.convert(b.bounds, to: nil))
+        let fit = h.fittingSize
+        let w = min(max(fit.width, 300), min(600, vis.width - 16))
+        let hgt = min(max(fit.height, 200), vis.height - 16)
+        let x = min(max(btnRect.midX - w / 2, vis.minX + 8), vis.maxX - w - 8)
+        let y = max(vis.minY + 8, min(btnRect.minY - hgt - 6, vis.maxY - hgt - 8))
+        let f = NSRect(x: x.rounded(), y: y.rounded(), width: w.rounded(), height: hgt.rounded())
+        if panel.frame != f { panel.setFrame(f, display: panel.isVisible) }
+    }
+
+    func addMonitors() {
+        removeMonitors()
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] _ in
+            self?.closePanel()
+        }) { monitors.append(g) }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown], handler: { [weak self] e in
+            guard let self = self else { return e }
+            if e.type == .keyDown {
+                if e.keyCode == 53 { self.closePanel(); return nil }
+                return e
+            }
+            // Clicks inside the panel stay; clicks on the status button are handled by togglePopover.
+            if e.window === self.panel || e.window === self.item.button?.window { return e }
+            self.closePanel()
+            return e
+        }) { monitors.append(l) }
+    }
+
+    func removeMonitors() {
+        for mon in monitors { NSEvent.removeMonitor(mon) }
+        monitors.removeAll()
+    }
+
+    func closePanel() {
+        removeMonitors()
+        guard panel.isVisible else { return }
+        panel.orderOut(nil)
+        lastPanelClose = Date()
+    }
+
+    @objc func appResigned() { closePanel() }
+    func windowDidResignKey(_ n: Notification) { closePanel() }
 
     func tick() {
         m.now = Date()

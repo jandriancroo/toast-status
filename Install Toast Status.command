@@ -33,7 +33,8 @@ if security find-generic-password -s "$KC_SERVICE" -a "$KC_ACCOUNT" >/dev/null 2
 else REPLACE=1; fi
 if [ "$REPLACE" = 1 ]; then
   read -r -s -p "Paste the ${MODE/remote/studio} status token (hidden), then Return: " TOKEN; echo
-  TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+  # Strip bracketed-paste markers (ESC[200~ / ESC[201~), any other control chars, and whitespace.
+  TOKEN="$(printf '%s' "$TOKEN" | LC_ALL=C sed -e $'s/\x1b\\[20[01]~//g' | LC_ALL=C tr -d '[:space:][:cntrl:]')"
   [ ${#TOKEN} -ge 32 ] || { echo "That doesn't look like a token (too short)."; exit 1; }
   security delete-generic-password -s "$KC_SERVICE" -a "$KC_ACCOUNT" >/dev/null 2>&1 || true
   # Pipe the token to `security -i` so it never shows up in the process list.

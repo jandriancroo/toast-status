@@ -20,3 +20,7 @@ Remove: `Uninstall Toast Status.command` (also deletes the Keychain token). The 
 
 ## v3.2.3
 - The menu-bar and popover-header dots follow runner health only: green for a valid session (including overnight idle or in-window polling), amber if the runner is overdue/stalled in the 9 AM–11 PM CT poll window or there is an error, and red only for signed out / `SESSION_EXPIRED`. **Closed · opens 11:00 AM CT** stays popover text. The runner and its poll window are unchanged.
+
+## v3.2.4
+- The status panel is now a borderless floating panel instead of an `NSPopover`. It opens right under the "● Toast" icon and is clamped inside the screen's visible area (8 pt margins), so it shifts left near the right edge and never gets cut off on smaller displays such as a 13" MacBook Air (1470×956). The top edge stays pinned under the menu bar when rows or messages change its height. It closes on a second icon click, a click anywhere outside, Escape, or switching apps.
+- The installer strips Terminal bracketed-paste markers (`ESC[200~` / `ESC[201~`) and other control characters, along with whitespace, from a pasted token before saving it to the Keychain.
